@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"syscall"
 	"time"
 
 	gax "github.com/googleapis/gax-go/v2"
@@ -36,6 +37,11 @@ const (
 	// should be retried.
 	// https://cloud.google.com/storage/docs/json_api/v1/status-codes#standardcodes
 	statusTooManyRequests = 429
+
+	// statusRequestTimeout is returned by the storage API if the request times
+	// out on the server side. The request should be retried.
+	// https://cloud.google.com/storage/docs/json_api/v1/status-codes#standardcodes
+	statusRequestTimeout = 408
 )
 
 // ResumableUpload is used by the generated APIs to provide resumable uploads.
@@ -226,16 +232,26 @@ func (rx *ResumableUpload) Upload(ctx context.Context) (resp *http.Response, err
 }
 
 // shouldRetry indicates whether an error is retryable for the purposes of this
-// package.
+// package, following guidance from
+// https://cloud.google.com/storage/docs/exponential-backoff .
 func shouldRetry(status int, err error) bool {
 	if 500 <= status && status <= 599 {
 		return true
 	}
-	if status == statusTooManyRequests {
+	if status == statusTooManyRequests || status == statusRequestTimeout {
 		return true
 	}
 	if err == io.ErrUnexpectedEOF {
 		return true
+	}
+	// Transient network errors should be retried.
+	if se, ok := err.(syscall.Errno); ok {
+		return se == syscall.ECONNRESET || se == syscall.ECONNREFUSED
+	}
+	// If Go 1.13 error unwrapping is available, use this to examine wrapped
+	// errors.
+	if err, ok := err.(interface{Unwrap() error}); ok {
+		return shouldRetry(status, err.Unwrap())
 	}
 	if err, ok := err.(interface{ Temporary() bool }); ok {
 		return err.Temporary()
